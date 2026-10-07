@@ -1,0 +1,63 @@
+rules_version = '2';
+// Squad Cards. Paste into Firebase console > Firestore > Rules > Publish.
+//
+// Who can do what, per deck:
+//   anyone with the link  read the deck config; read cards once revealed
+//   viewer                (signed in) same as above, and shows up in People
+//   suggester             also sees hidden cards, sends suggestions to the inbox
+//   editor                also changes stat values directly (nothing else)
+//   the friend on a card  changes that card's name, photo and photo position
+//   commissioner (owner)  everything
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function deckDoc(d) { return get(/databases/$(database)/documents/decks/$(d)).data; }
+    function isOwner(d) { return signedIn() && deckDoc(d).ownerUid == request.auth.uid; }
+    function memberPath(d) { return /databases/$(database)/documents/decks/$(d)/members/$(request.auth.uid); }
+    function hasRole(d, roles) { return signedIn() && exists(memberPath(d)) && get(memberPath(d)).data.role in roles; }
+    function canEdit(d) { return isOwner(d) || hasRole(d, ['editor']); }
+    function canSuggest(d) { return isOwner(d) || hasRole(d, ['editor', 'suggester']); }
+    function canSee(d) { return deckDoc(d).revealed == true || canSuggest(d); }
+    function onlyChanges(keys) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys); }
+
+    match /decks/{d} {
+      allow read: if true;
+      allow create: if signedIn() && request.resource.data.ownerUid == request.auth.uid;
+      allow update: if isOwner(d) && request.resource.data.ownerUid == resource.data.ownerUid;
+      allow delete: if isOwner(d);
+
+      match /players/{p} {
+        allow read: if canSee(d);
+        allow create, delete: if isOwner(d);
+        allow update: if isOwner(d)
+          || (hasRole(d, ['editor']) && onlyChanges(['stats', 'updatedAt']))
+          || (signedIn() && resource.data.linkedUid == request.auth.uid && onlyChanges(['name', 'photoPos', 'updatedAt']));
+      }
+
+      match /photos/{p} {
+        allow read: if canSee(d);
+        allow write: if isOwner(d)
+          || (signedIn() && get(/databases/$(database)/documents/decks/$(d)/players/$(p)).data.linkedUid == request.auth.uid);
+      }
+
+      match /members/{uid} {
+        allow read: if isOwner(d) || (signedIn() && request.auth.uid == uid);
+        allow create: if signedIn() && request.auth.uid == uid && request.resource.data.role == 'viewer';
+        allow update, delete: if isOwner(d);
+      }
+
+      match /suggestions/{s} {
+        allow read: if isOwner(d) || (signedIn() && resource.data.byUid == request.auth.uid);
+        allow create: if canSuggest(d) && request.resource.data.byUid == request.auth.uid
+          && request.resource.data.status == 'pending';
+        allow update, delete: if isOwner(d);
+      }
+
+      match /history/{h} {
+        allow read: if canSee(d);
+        allow create: if canEdit(d) && request.resource.data.byUid == request.auth.uid;
+        allow update, delete: if isOwner(d);
+      }
+    }
+  }
+}
