@@ -117,7 +117,7 @@ async function seedDemo() {
   const year = new Date().getFullYear();
   const id = await S.createDeck(me, `Class of ${year}`, year);
   const deck = { id, ...deckTemplate(year) };
-  const names = ['Youssef', 'Karim', 'Omar', 'Ahmed', 'Mostafa', 'Ziad', 'Hassan', 'Seif', 'Marwan', 'Adham'];
+  const names = ['Ace', 'Blaze', 'Comet', 'Dash', 'Echo', 'Flash', 'Ghost', 'Hawk', 'Jet', 'Knox'];
   const roles = ['CAP', 'DRV', 'CHF', 'CLN'];
   let n = 7;
   const rnd = (lo, hi) => { n = (n * 9301 + 49297) % 233280; return lo + Math.floor(n / 233280 * (hi - lo)); };
