@@ -191,15 +191,16 @@ a metallic rare finish, a ray pattern, an embossed double border, heavy type
 when you touch `js/card.js`. The background-removal model is `isnet_fp16`
 because `quint8` left speckles around the cut-out.
 
-### Status (as of 2026-10-07)
+### Status (as of 2026-10-08)
 
-- v1 is built and `node tools/smoke.cjs` passes in demo mode.
+- Built: v1 plus lives with majority votes, head to head and card backs.
+  `node tools/smoke.cjs` passes in demo mode.
+- `firestore.rules` passes `tools/rules-test.cjs` (45 allow/deny checks) in the
+  Firestore emulator. It has not run against a real project yet.
 - **Firebase isn't set up yet.** `js/config.js` is still `PASTE_ME`, so the app
   only runs in demo mode (`FIREBASE-SETUP.md` has the steps).
-- `firestore.rules` is written but **has never been run** against the
-  emulator or a real project. Treat it as untested.
-- Not deployed to GitHub Pages yet. The repo is private, and Pages on a
-  private repo needs a paid GitHub plan, so deployment is still undecided.
+- Not deployed. The repo is public now, so GitHub Pages is free whenever the
+  owner wants it.
 
 ### Working conventions
 
