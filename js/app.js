@@ -5,9 +5,10 @@
 //   #/d/ID/edit/PID         player editor (commissioner, or the friend linked to that card)
 //   #/d/ID/manage/TAB       commissioner settings
 //   #/d/ID/reveal           pack opening
+//   #/d/ID/vs/A/B           head to head (both cards optional)
 import * as S from './store.js';
-import { cardSvg, SKINS, FLAGS, flagBadge, skinGlow } from './card.js';
-import { overall, tierFor, clampStat, deckTemplate } from './overall.js';
+import { cardSvg, cardBackSvg, SKINS, FLAGS, flagBadge, skinGlow } from './card.js';
+import { overall, tierFor, clampStat, deckTemplate, livesTotal, livesLeft, votesNeeded, MAX_LIVES } from './overall.js';
 import { shareCard } from './export.js';
 import { processPhoto } from './photo.js';
 import { esc, $, $$, dialog, confirmDialog, alertDialog, ago } from './ui.js';
@@ -19,6 +20,9 @@ let view = null;
 let unwatch = null, watchedId, watchedUid;
 let drafts = {};
 let builtKey = null;
+let flipped = false;   // card page and editor preview: showing the back
+let demoVoter = null;  // demo mode: which demo friend is casting votes
+let vsShown = {};      // compare page: the two cards on screen
 
 const linkTo = id => `${location.origin}${location.pathname}#/d/${id}`;
 const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
@@ -26,6 +30,13 @@ const byOvr = (deck, list) => [...list].sort((a, b) => overall(b, deck) - overal
 const seenKey = id => `squad.seen.${id}`;
 const seen = id => { try { return !!localStorage.getItem(seenKey(id)); } catch { return true; } };
 const markSeen = id => { try { localStorage.setItem(seenKey(id), '1'); } catch {} };
+// Lives on a card face, or null when the deck plays without them.
+const livesOf = p => { const total = livesTotal(view.deck); return total ? { left: livesLeft(view.deck, p, view.votes), total } : null; };
+const cardOpts = p => ({ photo: view.photos[p.id], lives: livesOf(p) });
+// A card that flips to its scouting report when tapped.
+const flipCard = (deck, p, opts) => `<div class="flip ${flipped ? 'on' : ''}" data-act="flip" role="button" tabindex="0" aria-label="Flip the card">
+  <div class="flip-inner"><div class="flip-face">${cardSvg(deck, p, opts)}</div><div class="flip-face flip-back">${cardBackSvg(deck, p, opts)}</div></div></div>
+  <div class="flip-hint">Tap the card to flip it</div>`;
 const fail = e => { console.error(e); alertDialog('That did not work', e?.message || String(e)); };
 
 // ---------------------------------------------------------------- routing
@@ -33,7 +44,8 @@ const fail = e => { console.error(e); alertDialog('That did not work', e?.messag
 function parse() {
   const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map(decodeURIComponent);
   if (parts[0] !== 'd' || !parts[1]) return { name: 'home' };
-  const [, id, sub, arg] = parts;
+  const [, id, sub, arg, arg2] = parts;
+  if (sub === 'vs') return { name: 'vs', id, a: arg, b: arg2 };
   if (sub === 'p' && arg) return { name: 'card', id, pid: arg };
   if (sub === 'edit' && arg) return { name: 'edit', id, pid: arg };
   if (sub === 'manage') return { name: 'manage', id, tab: arg || 'players' };
@@ -46,7 +58,11 @@ function onRoute() {
   const prev = route;
   route = parse();
   if (route.id !== watchedId || me?.uid !== watchedUid) subscribe(route.id);
-  if (JSON.stringify(prev) !== JSON.stringify(route)) { drafts = {}; builtKey = null; window.scrollTo(0, 0); }
+  if (JSON.stringify(prev) !== JSON.stringify(route)) {
+    // Swapping a card on the compare page shouldn't jump to the top.
+    if (!(prev.name === 'vs' && route.name === 'vs')) window.scrollTo(0, 0);
+    drafts = {}; builtKey = null; flipped = false;
+  }
   render();
 }
 
@@ -70,6 +86,7 @@ function render() {
   if (!view.deck) { app.innerHTML = `<div class="locked"><h1>No deck here</h1><p class="muted">The link may be wrong, or the deck was deleted.</p></div>`; return; }
   if (route.name === 'deck') return deckPage();
   if (route.name === 'card') return cardPage();
+  if (route.name === 'vs') return comparePage();
   const formPage = { edit: editPage, reveal: revealPage, manage: managePage }[route.name];
   const key = JSON.stringify(route);
   if (builtKey === key && formPage.refresh) return formPage.refresh();
@@ -156,11 +173,12 @@ function deckPage() {
       <div class="sub">${deck.year} edition, ${plural(players.length, 'card')}${deck.revealed ? '' : ', hidden until reveal'}</div></div>
     <div class="actions">
       ${players.length ? `<a class="btn" href="#/d/${deck.id}/reveal">Open pack</a>` : ''}
+      ${players.length > 1 ? `<a class="btn" href="#/d/${deck.id}/vs">Compare</a>` : ''}
       <button class="btn" data-act="copy-link">Copy link</button>
       ${myRole === 'owner' ? `<a class="btn primary" href="#/d/${deck.id}/manage">Manage${pending ? ` <span class="count">${pending}</span>` : ''}</a>` : ''}
     </div></div>
     ${players.length ? `<div class="grid">${byOvr(deck, players).map(p => `<a href="#/d/${deck.id}/p/${p.id}">
-        ${cardSvg(deck, p, { photo: photos[p.id] })}<div class="under">${deltaHtml(deck, p)}</div></a>`).join('')}</div>`
+        ${cardSvg(deck, p, cardOpts(p))}<div class="under">${deltaHtml(deck, p)}${view.votes.some(v => v.pid === p.id && v.status === 'open') ? ' <span class="vote-tag">Vote open</span>' : ''}</div></a>`).join('')}</div>`
       : `<div class="empty">No cards yet.${myRole === 'owner' ? ` <a href="#/d/${deck.id}/manage/players">Add your friends</a>.` : ''}</div>`}`;
 }
 
@@ -179,7 +197,7 @@ function cardPage() {
   const role = (deck.roles || []).find(r => r.code === p.role);
   const dirty = Object.keys(d).some(k => d[k] !== p.stats?.[k]);
   const rows = (deck.stats || []).map(st => {
-    const v = shown.stats?.[st.key] ?? '';
+    const v = esc(shown.stats?.[st.key] ?? '');
     const changed = d[st.key] !== undefined && d[st.key] !== p.stats?.[st.key];
     const right = edit
       ? `<div class="stepper"><button class="btn" data-act="step" data-k="${st.key}" data-d="-1" aria-label="Lower">&minus;</button>
@@ -192,7 +210,7 @@ function cardPage() {
   const mySugs = suggestions.filter(s => s.pid === p.id && s.byUid === me?.uid);
 
   app.innerHTML = `<a class="back" href="#/d/${deck.id}">Back to the squad</a>
-  <div class="detail"><div class="big">${cardSvg(deck, shown, { photo: photos[p.id] })}</div>
+  <div class="detail"><div class="big">${flipCard(deck, shown, { photo: photos[p.id], lives: livesOf(p) })}</div>
   <div>
     <h1>${esc(p.name)}</h1>
     <div class="ovr-line">Overall <b>${ovr}</b>${role ? `, ${esc(role.name)}` : ''}, ${esc(p.skin ? SKINS[p.skin]?.label : tierFor(ovr, deck).name)} ${deltaHtml(deck, shown)}</div>
@@ -201,20 +219,120 @@ function cardPage() {
       ${edit ? `<button class="btn primary" data-act="save-stats" ${dirty ? '' : 'disabled'}>Save changes</button>
                 ${dirty ? '<button class="btn" data-act="discard">Discard</button>' : ''}` : ''}
       <button class="btn" data-act="save-image">Save image</button>
+      ${players.length > 1 ? `<a class="btn" href="#/d/${deck.id}/vs/${p.id}">Compare</a>` : ''}
       ${myRole === 'owner' || mine ? `<a class="btn" href="#/d/${deck.id}/edit/${p.id}">${myRole === 'owner' ? 'Edit card' : 'Edit my card'}</a>` : ''}
     </div>
     ${!S.isLocal && !me ? '<p class="hint">Want to suggest a change? <button class="linkbtn" data-act="signin">Sign in</button> and ask the commissioner to let you.</p>' : ''}
     ${mySugs.length ? `<div class="section"><h3>Your suggestions</h3><ul class="log">${mySugs.map(s => `<li>
-      <span>${esc(s.key)} ${s.from ?? '?'} to ${s.to}${s.note ? `<div class="note">${esc(s.note)}</div>` : ''}</span>
+      <span>${esc(s.key)} ${esc(s.from ?? '?')} to ${esc(s.to)}${s.note ? `<div class="note">${esc(s.note)}</div>` : ''}</span>
       <span class="when">${s.status === 'pending' ? 'Waiting' : s.status === 'accepted' ? 'Approved' : 'Rejected'}</span></li>`).join('')}</ul></div>` : ''}
+    ${livesSection(p)}
     ${log.length ? `<div class="section"><h3>Changes</h3>${historyList(log, myRole === 'owner', false)}</div>` : ''}
   </div></div>`;
 }
 
 function historyList(rows, canUndo, showName = true) {
-  return `<ul class="log">${rows.map(h => `<li><span>${showName ? `<b>${esc(h.pname)}</b> ` : ''}${esc(h.key)} ${h.from ?? '?'} to ${h.to}
+  return `<ul class="log">${rows.map(h => `<li><span>${showName ? `<b>${esc(h.pname)}</b> ` : ''}${esc(h.key)} ${esc(h.from ?? '?')} to ${esc(h.to)}
       <div class="note">${h.kind === 'undo' ? 'Undo' : h.kind === 'suggestion' ? 'Approved suggestion' : 'Edit'} by ${esc(h.byName)}${h.note ? `. ${esc(h.note)}` : ''}</div></span>
-      <span class="when">${ago(h.at)}${canUndo && h.from != null && h.kind !== 'undo' ? ` <button class="btn small" data-act="undo" data-h="${h.id}">Undo</button>` : ''}</span></li>`).join('')}</ul>`;
+      <span class="when">${ago(h.at)}${canUndo && h.from != null && h.kind !== 'undo' ? ` <button class="btn small" data-act="undo" data-h="${esc(h.id)}">Undo</button>` : ''}</span></li>`).join('')}</ul>`;
+}
+
+// ---------------------------------------------------------------- lives
+
+const OUTCOME = { passed: 'Life taken', failed: 'Spared', cancelled: 'Vote called off', overturned: 'Life given back' };
+
+// Who is voting on card p, and how many people can. In demo mode there is
+// only one real user, so the presenter votes as each demo friend in turn;
+// a card's own friend never votes on it.
+function voting(p) {
+  if (S.isLocal) {
+    const pool = byOvr(view.deck, view.players.filter(x => x.id !== p.id));
+    const as = pool.find(x => x.id === demoVoter) || pool[0];
+    return { eligible: pool.length, pool, who: as ? { uid: as.id, name: as.name } : null, why: 'Add another player to vote.' };
+  }
+  const voters = view.deck.voters || [];
+  const eligible = voters.filter(u => u !== p.linkedUid).length;
+  if (!me) return { eligible, who: null, why: 'signin' };
+  if (p.linkedUid === me.uid) return { eligible, who: null, why: "You can't vote on your own card." };
+  if (!voters.includes(me.uid)) return { eligible, who: null, why: 'You can vote once the commissioner next opens the deck.' };
+  return { eligible, who: { uid: me.uid, name: me.name } };
+}
+
+function livesSection(p) {
+  const total = livesTotal(view.deck);
+  if (!total) return '';
+  const left = livesLeft(view.deck, p, view.votes);
+  const mine = view.votes.filter(v => v.pid === p.id);
+  const open = mine.find(v => v.status === 'open');
+  const past = mine.filter(v => v !== open).slice(0, 15);
+  const vt = voting(p), owner = view.myRole === 'owner';
+  const why = vt.why === 'signin'
+    ? '<p class="hint">Sign in to vote. <button class="linkbtn" data-act="signin">Sign in</button></p>'
+    : `<p class="hint">${esc(vt.why)}</p>`;
+  const demoPick = S.isLocal && vt.pool?.length ? `<label class="field demo-as"><span>Demo mode: voting as</span>
+    <select data-act-change="demo-voter">${vt.pool.map(x => `<option value="${esc(x.id)}" ${x.id === vt.who?.uid ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}</select></label>` : '';
+  let body;
+  if (open) {
+    const y = Object.keys(open.yes).length, n = Object.keys(open.no).length;
+    const cast = vt.who && (open.yes[vt.who.uid] ? 'yes' : open.no[vt.who.uid] ? 'no' : '');
+    body = `<div class="vote">
+      <div class="vote-head"><b>Vote: take a life</b><span class="when">${ago(open.at)}</span></div>
+      ${open.reason ? `<p class="vote-reason">"${esc(open.reason)}"</p>` : ''}
+      <div class="muted">Started by ${esc(open.byName)}. Needs ${votesNeeded(vt.eligible)} of ${vt.eligible} to take it.</div>
+      <div class="tally"><span><b>${y}</b> take it</span><span><b>${n}</b> spare</span></div>
+      ${demoPick}
+      ${vt.who ? `<div class="actions"><button class="btn ${cast === 'yes' ? 'primary' : ''}" data-act="vote-cast" data-v="${esc(open.id)}" data-take="1">Take a life</button>
+        <button class="btn ${cast === 'no' ? 'primary' : ''}" data-act="vote-cast" data-v="${esc(open.id)}" data-take="0">Spare them</button></div>` : why}
+      ${owner ? `<button class="linkbtn" data-act="vote-close" data-v="${esc(open.id)}" data-s="cancelled">Call off this vote</button>` : ''}</div>`;
+  } else if (!left) {
+    body = '<p class="muted">Out. No lives left.</p>';
+  } else {
+    body = vt.who ? `${demoPick}<button class="btn" data-act="vote-start">Start a vote to take a life</button>` : why;
+  }
+  return `<div class="section"><h3>Lives <span class="hearts">${'&#9829;'.repeat(left)}<span class="lost">${'&#9829;'.repeat(total - left)}</span></span> <span class="muted">${left} of ${total}</span></h3>
+    ${body}
+    ${past.length ? `<ul class="log">${past.map(v => `<li><span>${OUTCOME[v.status] || esc(v.status)}${v.reason ? `<div class="note">${esc(v.reason)}</div>` : ''}</span>
+      <span class="when">${Object.keys(v.yes).length} to ${Object.keys(v.no).length}, ${ago(v.closedAt || v.at)}${owner && v.status === 'passed'
+        ? ` <button class="btn small" data-act="vote-close" data-v="${esc(v.id)}" data-s="overturned">Give it back</button>` : ''}</span></li>`).join('')}</ul>` : ''}</div>`;
+}
+
+// ---------------------------------------------------------------- head to head
+
+function comparePage() {
+  const { deck, players } = view;
+  if (view.locked) return lockedPage();
+  const back = `<a class="back" href="#/d/${deck.id}">Back to the squad</a>`;
+  if (players.length < 2) { app.innerHTML = `${back}<div class="empty">You need two cards to compare.</div>`; return; }
+  const sorted = byOvr(deck, players);
+  const A = players.find(x => x.id === route.a) || sorted[0];
+  const B = players.find(x => x.id === route.b && x.id !== A.id) || sorted.find(x => x.id !== A.id);
+  vsShown = { a: A.id, b: B.id };
+  const pick = (side, cur) => `<select data-act-change="vs-pick" data-side="${side}" aria-label="Pick a card">${sorted.map(p =>
+    `<option value="${esc(p.id)}" ${p.id === cur.id ? 'selected' : ''}>${esc(p.name)} (${overall(p, deck)})</option>`).join('')}</select>`;
+  // Higher wins, except "higher is worse" stats where the lower number wins.
+  const side = (a, b, invert) => a == null || b == null || a === b ? 0 : (invert ? a < b : a > b) ? 1 : 2;
+  let wa = 0, wb = 0;
+  const rows = (deck.stats || []).map(st => {
+    const a = A.stats?.[st.key] ?? null, b = B.stats?.[st.key] ?? null, w = side(a, b, st.invert);
+    if (w === 1) wa++; if (w === 2) wb++;
+    return `<div class="vsrow"><span class="v ${w === 1 ? 'win' : ''}">${esc(a ?? '-')}</span>
+      <span class="vsk"><b>${esc(st.key)}</b><small>${esc(st.name)}${st.invert ? ', lower wins' : ''}</small></span>
+      <span class="v ${w === 2 ? 'win' : ''}">${esc(b ?? '-')}</span></div>`;
+  }).join('');
+  const oa = overall(A, deck), ob = overall(B, deck), wo = side(oa, ob, false);
+  const n = (deck.stats || []).length;
+  const verdict = wa === wb ? `Level: ${wa} stats each.` : `${esc(wa > wb ? A.name : B.name)} takes ${Math.max(wa, wb)} of ${n} stats.`;
+  app.innerHTML = `${back}<h1>Head to head</h1>
+    <div class="vs">
+      <div class="vs-side">${pick('a', A)}<a href="#/d/${deck.id}/p/${A.id}">${cardSvg(deck, A, cardOpts(A))}</a></div>
+      <div class="vs-mid">VS</div>
+      <div class="vs-side">${pick('b', B)}<a href="#/d/${deck.id}/p/${B.id}">${cardSvg(deck, B, cardOpts(B))}</a></div>
+    </div>
+    <div class="vs-table">
+      <div class="vsrow ovr"><span class="v ${wo === 1 ? 'win' : ''}">${oa}</span><span class="vsk"><b>OVR</b><small>Overall</small></span><span class="v ${wo === 2 ? 'win' : ''}">${ob}</span></div>
+      ${rows}
+    </div>
+    <p class="vs-verdict">${verdict}</p>`;
 }
 
 // ---------------------------------------------------------------- player editor
@@ -240,6 +358,7 @@ function editPage() {
       <label class="field"><span>Flag</span><select name="flag">${opt('', 'Deck default', p.flag)}${Object.entries(FLAGS).map(([k, f]) => opt(k, f ? f.name : 'No flag', p.flag)).join('')}</select></label>
       <label class="field"><span>Top line (optional)</span><input name="tag" value="${esc(p.tag || '')}" maxlength="22" placeholder="e.g. PLAYER OF THE YEAR"></label>
     </div>
+    <label class="field"><span>Scouting report (back of the card)</span><textarea name="bio" rows="4" maxlength="240" placeholder="Two lines on why they're rated like this">${esc(p.bio || '')}</textarea></label>
     <fieldset><legend>Stats</legend><div class="stat-inputs">${(deck.stats || []).map(s =>
       `<label title="${esc(s.name)}"><b>${esc(s.key)}</b><input class="num" type="number" min="1" max="99" name="stat.${esc(s.key)}" value="${p.stats?.[s.key] ?? 60}"></label>`).join('')}</div>
       <label class="field" style="margin-top:12px"><span>Overall override (leave empty to calculate it)</span><input class="num" type="number" min="1" max="99" name="ovrOverride" value="${Number.isFinite(p.ovrOverride) ? p.ovrOverride : ''}"></label>
@@ -292,7 +411,7 @@ function readPlayerForm(form, draft) {
 
 function paintPreview() {
   const pv = $('#pv');
-  if (pv) pv.innerHTML = cardSvg(view.deck, drafts.player, { photo: view.photos[route.pid] });
+  if (pv) pv.innerHTML = flipCard(view.deck, drafts.player, { photo: view.photos[route.pid], lives: livesOf(drafts.player) });
 }
 
 // ---------------------------------------------------------------- manage
@@ -326,7 +445,7 @@ const TAB_RENDER = {
     const { deck, players } = view;
     el.innerHTML = `<div class="actions" style="margin-bottom:12px"><button class="btn primary" data-act="add-player">Add player</button></div>
       ${players.length ? byOvr(deck, players).map(p => `<a class="prow" href="#/d/${deck.id}/edit/${p.id}">
-        <div class="mini">${cardSvg(deck, p, { photo: view.photos[p.id] })}</div>
+        <div class="mini">${cardSvg(deck, p, cardOpts(p))}</div>
         <div><b>${esc(p.name)}</b><div class="muted">${overall(p, deck)} overall${p.role ? `, ${esc(p.role)}` : ''}${view.photos[p.id] ? '' : ', no photo yet'}</div></div>
         <span class="muted">Edit</span></a>`).join('') : '<div class="empty">No players yet.</div>'}`;
   },
@@ -386,10 +505,10 @@ const TAB_RENDER = {
   inbox(el) {
     const sug = view.suggestions;
     const pending = sug.filter(s => s.status === 'pending'), done = sug.filter(s => s.status !== 'pending').slice(0, 30);
-    const line = s => `<span><b>${esc(s.pname)}</b> ${esc(s.key)} ${s.from ?? '?'} to ${s.to}<div class="note">From ${esc(s.byName)}${s.note ? `: ${esc(s.note)}` : ''}</div></span>`;
+    const line = s => `<span><b>${esc(s.pname)}</b> ${esc(s.key)} ${esc(s.from ?? '?')} to ${esc(s.to)}<div class="note">From ${esc(s.byName)}${s.note ? `: ${esc(s.note)}` : ''}</div></span>`;
     el.innerHTML = `${pending.length ? `<ul class="log">${pending.map(s => `<li>${line(s)}<span class="actions">
-        <button class="btn small primary" data-act="sug-yes" data-s="${s.id}">Approve</button>
-        <button class="btn small" data-act="sug-no" data-s="${s.id}">Reject</button></span></li>`).join('')}</ul>`
+        <button class="btn small primary" data-act="sug-yes" data-s="${esc(s.id)}">Approve</button>
+        <button class="btn small" data-act="sug-no" data-s="${esc(s.id)}">Reject</button></span></li>`).join('')}</ul>`
       : '<div class="empty">No suggestions waiting.</div>'}
       ${done.length ? `<div class="section"><h3>Already handled</h3><ul class="log">${done.map(s => `<li>${line(s)}<span class="when">${s.status === 'accepted' ? 'Approved' : 'Rejected'}</span></li>`).join('')}</ul></div>` : ''}`;
   },
@@ -405,6 +524,7 @@ const TAB_RENDER = {
       <div class="two"><label class="field"><span>Deck name</span><input name="name" value="${esc(d.name)}"></label>
         <label class="field"><span>Year</span><input name="year" type="number" value="${d.year}"></label>
         <label class="field"><span>Badge text</span><input name="crest" value="${esc(d.crest ?? '')}" maxlength="3"></label>
+        <label class="field"><span>Lives per card (0 turns votes off)</span><input name="lives" type="number" min="0" max="${MAX_LIVES}" value="${livesTotal(d)}"></label>
         <label class="field"><span>Default flag</span><select name="flag">${Object.entries(FLAGS).map(([k, f]) => `<option value="${k}" ${k === (d.flag || 'none') ? 'selected' : ''}>${esc(f ? f.name : 'No flag')}</option>`).join('')}</select></label></div>
       <label class="field"><span>Reveal date (shown to friends while the cards are hidden)</span><input name="revealAt" type="datetime-local" value="${local}"></label>
       <button class="btn primary" type="button" data-act="edition-save">Save</button></form>
@@ -462,7 +582,7 @@ function revealPage() {
     rv.style.setProperty('--glow', skinGlow(deck, p));
     rv.classList.add('lit');
     count.textContent = `${i + 1} / ${order.length}`;
-    stage.innerHTML = `<div class="flyin">${cardSvg(deck, p, { photo: photos[p.id] })}</div>`;
+    stage.innerHTML = `<div class="flyin">${cardSvg(deck, p, cardOpts(p))}</div>`;
     tap.textContent = i === order.length - 1 ? 'Tap to see the squad' : 'Tap for the next card';
   };
   // The best card gets a walkout, like a FUT board: nation, role, then the card.
@@ -549,7 +669,7 @@ const ACTIONS = {
   'save-image': async b => {
     const p = view.players.find(x => x.id === route.pid);
     const t = b.textContent; b.textContent = 'Saving'; b.disabled = true;
-    try { await shareCard(view.deck, p, view.photos[p.id]); } catch (e) { fail(e); }
+    try { await shareCard(view.deck, p, view.photos[p.id], { lives: livesOf(p) }); } catch (e) { fail(e); }
     b.textContent = t; b.disabled = false;
   },
   undo: async b => {
@@ -562,7 +682,7 @@ const ACTIONS = {
     readPlayerForm(form, draft);
     const owner = view.myRole === 'owner';
     const patch = owner
-      ? { name: draft.name.trim() || 'Player', role: draft.role || '', skin: draft.skin || '', flag: draft.flag || '', tag: draft.tag || '',
+      ? { name: draft.name.trim() || 'Player', role: draft.role || '', skin: draft.skin || '', flag: draft.flag || '', tag: draft.tag || '', bio: (draft.bio || '').trim(),
           stats: draft.stats, ovrOverride: draft.ovrOverride ?? null, photoPos: draft.photoPos, ...(S.isLocal ? {} : { linkedUid: draft.linkedUid || '' }) }
       : { name: draft.name.trim() || 'Player', photoPos: draft.photoPos };
     b.disabled = true;
@@ -633,7 +753,8 @@ const ACTIONS = {
     b.disabled = true;
     try {
       await S.updateDeck(view.deck.id, { name: f.name.value.trim() || view.deck.name, year, crest: f.crest.value.trim(), flag: f.flag.value,
-        revealAt: f.revealAt.value ? new Date(f.revealAt.value).getTime() : null });
+        revealAt: f.revealAt.value ? new Date(f.revealAt.value).getTime() : null,
+        lives: Math.max(0, Math.min(MAX_LIVES, Math.round(Number(f.lives.value) || 0))) });
       b.textContent = 'Saved';
     } catch (e) { fail(e); }
     b.disabled = false;
@@ -658,6 +779,33 @@ const ACTIONS = {
   'sug-yes': b => S.resolveSuggestion(view, view.suggestions.find(s => s.id === b.dataset.s), true, me).catch(fail),
   'sug-no': b => S.resolveSuggestion(view, view.suggestions.find(s => s.id === b.dataset.s), false, me).catch(fail),
   'reveal-done': () => revealPage.finish?.(),
+
+  flip: b => { flipped = !flipped; b.classList.toggle('on', flipped); },
+  'vote-start': async () => {
+    const p = view.players.find(x => x.id === route.pid), vt = voting(p);
+    if (!vt.who) return;
+    const rule = vt.eligible <= 1 ? 'With one voter, your vote decides it.'
+      : `It takes ${votesNeeded(vt.eligible)} of ${vt.eligible} people saying yes. Your vote counts as the first yes.`;
+    const reason = await dialog(`Take a life from ${p.name}?`, `<p class="muted">${esc(rule)}</p>
+      <label class="field"><span>Why (optional)</span><input id="vr" maxlength="140"></label>`,
+      [{ label: 'Cancel', value: null }, { label: 'Start the vote', value: true, primary: true }], box => $('#vr', box).value.trim());
+    if (reason == null) return;
+    S.startVote(view.deck.id, p, reason, vt.who, vt.eligible).catch(fail);
+  },
+  'vote-cast': b => {
+    const p = view.players.find(x => x.id === route.pid), v = view.votes.find(x => x.id === b.dataset.v), vt = voting(p);
+    if (!v || !vt.who || v.status !== 'open') return;
+    b.disabled = true;
+    S.castVote(view.deck.id, v, vt.who, b.dataset.take === '1', vt.eligible).catch(e => { b.disabled = false; fail(e); });
+  },
+  'vote-close': async b => {
+    const v = view.votes.find(x => x.id === b.dataset.v), to = b.dataset.s;
+    if (!v) return;
+    const ok = to === 'overturned'
+      ? await confirmDialog('Give the life back?', `${v.pname} gets this life back. The vote stays in the list.`, 'Give it back')
+      : await confirmDialog('Call off this vote?', 'Nobody loses a life from it.', 'Call it off');
+    if (ok) S.closeVote(view.deck.id, v, to).catch(fail);
+  },
 };
 
 document.addEventListener('click', e => {
@@ -669,8 +817,21 @@ document.addEventListener('click', e => {
   fn(b, e);
 });
 document.addEventListener('change', e => {
-  const s = e.target.closest('[data-act-change="member-role"]');
-  if (s) S.setMemberRole(view.deck.id, s.dataset.uid, s.value).catch(fail);
+  const s = e.target.closest('[data-act-change]');
+  if (!s) return;
+  const act = s.dataset.actChange;
+  if (act === 'member-role') S.setMemberRole(view.deck.id, s.dataset.uid, s.value).catch(fail);
+  if (act === 'demo-voter') { demoVoter = s.value; render(); }
+  if (act === 'vs-pick') {
+    const other = $(`[data-act-change="vs-pick"]:not([data-side="${s.dataset.side}"])`)?.value;
+    // Picking the card that's already on the other side swaps them.
+    const mine = s.value, theirs = other === mine ? vsShown[s.dataset.side] : other;
+    const [a, b] = s.dataset.side === 'a' ? [mine, theirs] : [theirs, mine];
+    location.hash = `#/d/${view.deck.id}/vs/${encodeURIComponent(a)}/${encodeURIComponent(b)}`;
+  }
+});
+document.addEventListener('keydown', e => {
+  if ((e.key === 'Enter' || e.key === ' ') && e.target.matches?.('.flip[data-act]')) { e.preventDefault(); e.target.click(); }
 });
 
 window.addEventListener('hashchange', onRoute);

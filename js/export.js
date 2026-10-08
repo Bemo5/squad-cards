@@ -16,8 +16,8 @@ async function embeddedFonts() {
   return fontCss;
 }
 
-export async function cardPng(deck, player, photo) {
-  const svg = cardSvg(deck, player, { photo, fontCss: await embeddedFonts(), width: 900 })
+export async function cardPng(deck, player, photo, extra = {}) {
+  const svg = cardSvg(deck, player, { ...extra, photo, fontCss: await embeddedFonts(), width: 900 })
     .replace('viewBox="0 0 300 420"', 'viewBox="0 0 300 420" height="1260"');
   const url = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' }));
   try {
@@ -34,8 +34,8 @@ export async function cardPng(deck, player, photo) {
 }
 
 // Phones get the share sheet; desktops get a download.
-export async function shareCard(deck, player, photo) {
-  const blob = await cardPng(deck, player, photo);
+export async function shareCard(deck, player, photo, extra) {
+  const blob = await cardPng(deck, player, photo, extra);
   const name = `${(player.name || 'card').replace(/[^\w-]+/g, '_')}-${deck.year || ''}.png`;
   const file = new File([blob], name, { type: 'image/png' });
   if (navigator.canShare?.({ files: [file] })) {

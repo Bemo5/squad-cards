@@ -21,13 +21,26 @@ Each deck holds its own:
   bronze). A skin set on a player by hand (Team of the Year, Icon) wins.
 - **Skins and flags**: palettes in `js/card.js` (`SKINS`, `FLAGS`). Add an
   entry there and it shows up in every menu.
+- **Lives**: how many each card starts with (5 by default, 0 turns them off).
+
+## On top of the cards
+
+- **Scouting report**: tap a card to flip it. The back shows a short bio the
+  commissioner writes in the card editor.
+- **Head to head**: Compare puts two cards side by side and marks who wins each
+  stat (for "higher is worse" stats the lower number wins).
+- **Lives**: anyone signed in can start a vote to take a life from a card.
+  It passes when more than half of the eligible voters say yes (everyone who
+  has joined the deck plus the commissioner, minus the friend on that card).
+  At zero lives the card is stamped OUT. The commissioner can call off a vote
+  or give a life back. In demo mode you pick which demo friend is voting.
 
 ## Who can do what
 
 | Role | Can |
 | --- | --- |
 | Anyone with the link | See the cards once revealed. No sign-in. |
-| Viewer | Signed in; shows up in Manage > People so you can promote them. |
+| Viewer | Signed in; shows up in Manage > People so you can promote them. Votes on lives. |
 | Suggester | Proposes stat changes; they wait in your inbox. |
 | Editor | Changes stat values directly. Every change is in History and can be undone. |
 | The friend on a card | Changes that card's name and photo, if you link them to it. |
@@ -50,6 +63,8 @@ Enforced by `firestore.rules`, not just hidden in the UI.
 node serve.cjs              # http://127.0.0.1:8125
 node tools/smoke.cjs        # end-to-end check in demo mode (needs the server)
 node tools/photo-check.cjs  # runs the real photo cut-out (needs internet)
+npx firebase-tools emulators:exec --only firestore --project demo-squad "node tools/rules-test.cjs"
+                            # checks firestore.rules in the emulator (needs Java)
 ```
 
 Photos are stored as small webp data URLs in Firestore (no Firebase Storage,
@@ -103,18 +118,22 @@ look odd until you know them.
 | `js/config.js` | Firebase web config (public by design). Still `PASTE_ME`. |
 | `firestore.rules` | The real permission model. |
 | `tools/smoke.cjs` | End-to-end test in demo mode through Chrome DevTools Protocol (`tools/cdp.cjs`). Screenshots go to `tools/shots/` (gitignored). |
+| `tools/rules-test.cjs` | Allow/deny checks for `firestore.rules` against the emulator, over its REST API (no npm packages). |
 
 ### Data model (Firestore)
 
 ```
 decks/{d}             name, year, crest, flag, stats[], roles[], tiers[],
-                      revealed, ownerUid, ownerName, prevDeckId
+                      revealed, ownerUid, ownerName, prevDeckId,
+                      lives, voters[uid]
   players/{p}         name, role, stats{KEY: 1-99}, skin, tag, flag,
-                      photoPos, linkedUid, prevOvr, ovrOverride
+                      photoPos, linkedUid, prevOvr, ovrOverride, bio
   photos/{p}          data (webp data URL)
   members/{uid}       name, email, role: viewer | suggester | editor
   suggestions/{s}     pid, key, from, to, note, byUid, byName, status
   history/{h}         pid, pname, key, from, to, kind, byUid, byName, at
+  votes/{v}           pid, pname, reason, byUid, byName, yes{uid: true},
+                      no{uid: true}, status, at, closedAt
 ```
 
 A stat is `{key, name, invert?}`. A role is `{code, name, weights{KEY: n}}`.
@@ -140,12 +159,24 @@ A tier is `{name, min, skin}`.
     and photo position. Nothing else.
   - Signed-in visitors register themselves as `viewer` (`ensureMember`) so the
     commissioner can find and promote them.
+  - Votes on lives are the one thing every signed-in member does. A vote never
+    touches a player doc: lives left = `deck.lives` minus that card's votes with
+    status `passed` (`livesLeft()` in `js/overall.js`).
+- **Lives voting**: rules can't count a collection, so `deck.voters` holds the
+  commissioner plus every member uid. The owner's browser rewrites it whenever
+  the member list changes (`syncVoters` in `watchDeck`), which means a friend
+  who just joined can vote once the commissioner next opens the deck. A voter
+  only ever changes their own key in `yes`/`no`, and every write must carry the
+  status the ballots imply (`statusFor()`: yes x2 > eligible passes, no x2 >=
+  eligible fails). The rules recompute it, so nobody can close a vote early.
+  Keep `statusFor()` identical in `js/overall.js` and `firestore.rules`.
 - **Hidden until reveal**: while `revealed == false`, the rules block reading
   players, photos and history unless you're a suggester or above. `watchDeck()`
   mirrors this: it re-subscribes when your role or the reveal flag changes.
   Otherwise the listeners would just hit permission errors.
-- **New edition** copies config, players and photos into a new deck and stores
-  each player's old overall as `prevOvr` so cards show the year-on-year change.
+- **New edition** copies config, players, photos and members (with their
+  roles) into a new deck and stores each player's old overall as `prevOvr` so
+  cards show the year-on-year change. Votes don't carry over: lives reset.
   The deck doc is written in its own batch **before** the players, because
   rules `get()` sees the database as it was before the batch.
 - If you change who can write what, change `firestore.rules` **and** the UI
@@ -175,7 +206,9 @@ because `quint8` left speckles around the cut-out.
 - Don't add UI nobody asked for (banners, toasts, onboarding strips). Behaviour
   changes stay invisible unless the owner wants them shown.
 - Escape all user text with `esc()` before it goes into HTML. Screens are
-  built from template strings.
+  built from template strings. Values written by other people (stats, history,
+  suggestions, votes, photos) are also coerced to their expected shape in
+  `store.js` as they arrive, because the rules can't check every value in a map.
 - Forms on the manage/editor pages are built once per route, then only
   refreshed (`builtKey` in `app.js`), so a live Firestore update doesn't wipe
   what someone is typing. Keep that in mind when adding fields.

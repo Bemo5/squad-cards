@@ -3,7 +3,7 @@
 //   watchDoc(path, cb, onErr) / watchCol(path, q, cb, onErr) -> unsubscribe
 //   getCol(path, q) -> [{id, ...}]
 //   batch([{op:'set'|'update'|'delete', path, data}])
-//   newId(), now(), auth: watch(cb) / signIn() / signOut()
+//   newId(), now(), del() (removes a field in an update), auth: watch(cb) / signIn() / signOut()
 // q = {where: [field, '==', value], orderBy: [field, 'asc'|'desc'], limit}
 import { firebaseConfig, isConfigured } from './config.js';
 
@@ -49,6 +49,7 @@ async function firebaseAdapter() {
     },
     newId: () => F.doc(F.collection(fs, '_')).id,
     now: () => F.serverTimestamp(),
+    del: () => F.deleteField(),
     auth: {
       watch: cb => A.onAuthStateChanged(auth, u => cb(u && { uid: u.uid, name: u.displayName || u.email, email: u.email })),
       signIn: () => A.signInWithPopup(auth, new A.GoogleAuthProvider()),
@@ -115,6 +116,7 @@ function localAdapter() {
     },
     newId: () => Math.random().toString(36).slice(2, 12),
     now: () => Date.now(),
+    del: () => undefined,
     auth: {
       watch: cb => { queueMicrotask(() => cb(user)); return () => {}; },
       signIn: async () => {},

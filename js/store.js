@@ -1,13 +1,16 @@
 // Everything the app reads and writes, written once against db.js.
 //
-// decks/{d}                 config: name, year, stats, roles, tiers, revealed, ownerUid
-//   players/{p}             name, role, stats{}, skin, tag, flag, photoPos, linkedUid, prevOvr
+// decks/{d}                 config: name, year, stats, roles, tiers, revealed, ownerUid,
+//                           lives (per card, 0 = off), voters [uid] (kept in sync by the owner)
+//   players/{p}             name, role, stats{}, skin, tag, flag, photoPos, linkedUid, prevOvr, bio
 //   photos/{p}              data (webp data URL); separate so the deck list stays light
 //   members/{uid}           name, email, role: viewer | suggester | editor
 //   suggestions/{s}         pid, key, from, to, note, byUid, byName, status
 //   history/{h}             pid, pname, key, from, to, kind, byUid, byName, at
+//   votes/{v}               pid, pname, reason, byUid, byName, yes{uid:true}, no{uid:true},
+//                           status: open | passed | failed | cancelled | overturned, at, closedAt
 import { db } from './db.js';
-import { overall, clampStat, deckTemplate } from './overall.js';
+import { overall, clampStat, deckTemplate, statusFor } from './overall.js';
 
 export const isLocal = db.local;
 export const auth = db.auth;
@@ -17,10 +20,29 @@ export const ROLE_RANK = { none: 0, viewer: 1, suggester: 2, editor: 3, owner: 4
 export const canEdit = r => ROLE_RANK[r] >= 3;
 export const canSuggest = r => ROLE_RANK[r] >= 2;
 
+// Other people write these documents, and screens are built from template
+// strings, so values are coerced to the shapes the app expects on the way in.
+// The rules can't check every value in a map, so this is the backstop.
+const str = v => (typeof v === 'string' ? v : v == null ? '' : String(v));
+const num = v => (v == null || v === '' || !Number.isFinite(Number(v)) ? null : Number(v));
+const statMap = m => Object.fromEntries(Object.entries(m && typeof m === 'object' ? m : {})
+  .map(([k, v]) => [k, clampStat(v)]));
+const cleanPlayer = p => ({
+  ...p, name: str(p.name), role: str(p.role), tag: str(p.tag), bio: str(p.bio), stats: statMap(p.stats),
+  prevOvr: num(p.prevOvr), ovrOverride: num(p.ovrOverride) == null ? null : clampStat(p.ovrOverride),
+  photoPos: p.photoPos && typeof p.photoPos === 'object' ? { x: num(p.photoPos.x) ?? 0, y: num(p.photoPos.y) ?? 0, s: num(p.photoPos.s) ?? 1 } : { x: 0, y: 0, s: 1 },
+});
+const cleanChange = h => ({ ...h, key: str(h.key), pname: str(h.pname), byName: str(h.byName), note: str(h.note),
+  from: num(h.from) == null ? null : clampStat(h.from), to: clampStat(h.to) });
+const isImage = v => typeof v === 'string' && /^data:image\/(webp|png|jpeg);base64,/.test(v);
+const ballots = m => Object.fromEntries(Object.keys(m && typeof m === 'object' ? m : {}).map(k => [k, true]));
+const cleanVote = v => ({ ...v, pid: str(v.pid), pname: str(v.pname), reason: str(v.reason), byName: str(v.byName),
+  yes: ballots(v.yes), no: ballots(v.no), status: str(v.status) || 'open' });
+
 // One live view of a deck: calls cb({deck, players, photos, history,
 // suggestions, members, myRole, locked}) whenever any part changes.
 export function watchDeck(id, me, cb) {
-  const state = { deck: undefined, players: [], photos: {}, history: [], suggestions: [], members: [], member: null, locked: false };
+  const state = { deck: undefined, players: [], photos: {}, history: [], suggestions: [], members: [], votes: [], member: null, locked: false };
   const unsubs = [];
   let inner = [];
   const emit = () => {
@@ -44,20 +66,33 @@ export function watchDeck(id, me, cb) {
     if (k === key) return;
     key = k; stopInner();
     state.locked = !see;
-    if (!see) { state.players = []; state.photos = {}; state.history = []; emit(); return; }
+    if (!see) { state.players = []; state.photos = {}; state.history = []; state.votes = []; emit(); return; }
     const fail = e => { console.warn(e); state.locked = true; emit(); };
-    inner.push(db.watchCol(`${D(id)}/players`, {}, rows => { state.players = rows; emit(); }, fail));
+    inner.push(db.watchCol(`${D(id)}/players`, {}, rows => { state.players = rows.map(cleanPlayer); emit(); }, fail));
     inner.push(db.watchCol(`${D(id)}/photos`, {}, rows => {
-      state.photos = Object.fromEntries(rows.map(r => [r.id, r.data])); emit();
+      state.photos = Object.fromEntries(rows.filter(r => isImage(r.data)).map(r => [r.id, r.data])); emit();
     }, fail));
-    inner.push(db.watchCol(`${D(id)}/history`, { orderBy: ['at', 'desc'], limit: 300 }, rows => { state.history = rows; emit(); }, fail));
+    inner.push(db.watchCol(`${D(id)}/history`, { orderBy: ['at', 'desc'], limit: 300 }, rows => { state.history = rows.map(cleanChange); emit(); }, fail));
+    inner.push(db.watchCol(`${D(id)}/votes`, { orderBy: ['at', 'desc'] }, rows => { state.votes = rows.map(cleanVote); emit(); }, fail));
     if (role === 'owner') {
-      inner.push(db.watchCol(`${D(id)}/suggestions`, { orderBy: ['at', 'desc'] }, rows => { state.suggestions = rows; emit(); }, fail));
-      inner.push(db.watchCol(`${D(id)}/members`, {}, rows => { state.members = rows; emit(); }, fail));
+      inner.push(db.watchCol(`${D(id)}/suggestions`, { orderBy: ['at', 'desc'] }, rows => { state.suggestions = rows.map(cleanChange); emit(); }, fail));
+      inner.push(db.watchCol(`${D(id)}/members`, {}, rows => { state.members = rows; syncVoters(); emit(); }, fail));
     } else if (me && canSuggest(role)) {
       inner.push(db.watchCol(`${D(id)}/suggestions`, { where: ['byUid', '==', me.uid] }, rows => {
-        state.suggestions = rows.sort((a, b) => (b.at || 0) - (a.at || 0)); emit();
+        state.suggestions = rows.map(cleanChange).sort((a, b) => (b.at || 0) - (a.at || 0)); emit();
       }, fail));
+    }
+  };
+
+  // Who may vote on lives: the commissioner plus everyone who has joined.
+  // Rules can't count a collection, so the owner's browser keeps this list
+  // on the deck doc whenever the member list changes.
+  const syncVoters = () => {
+    const d = state.deck;
+    if (db.local || !d || !me || d.ownerUid !== me.uid) return;
+    const want = [me.uid, ...state.members.map(m => m.id).filter(u => u !== me.uid)].sort();
+    if (JSON.stringify(want) !== JSON.stringify([...(d.voters || [])].sort())) {
+      db.batch([{ op: 'update', path: D(id), data: { voters: want } }]).catch(console.warn);
     }
   };
 
@@ -123,13 +158,10 @@ export async function saveRoleDefs(view, rows) {
 
 export async function deleteDeck(view) {
   const id = view.deck.id;
-  const ops = [
-    ...view.players.map(p => ({ op: 'delete', path: `${D(id)}/players/${p.id}` })),
-    ...Object.keys(view.photos).map(p => ({ op: 'delete', path: `${D(id)}/photos/${p}` })),
-    ...view.history.map(h => ({ op: 'delete', path: `${D(id)}/history/${h.id}` })),
-    ...view.suggestions.map(s => ({ op: 'delete', path: `${D(id)}/suggestions/${s.id}` })),
-    ...view.members.map(m => ({ op: 'delete', path: `${D(id)}/members/${m.id}` })),
-  ];
+  // The live view caps history, so read the full sub-collections here.
+  const all = await Promise.all(['players', 'photos', 'history', 'suggestions', 'members', 'votes']
+    .map(c => db.getCol(`${D(id)}/${c}`).then(rows => rows.map(r => `${D(id)}/${c}/${r.id}`))));
+  const ops = all.flat().map(path => ({ op: 'delete', path }));
   // Firestore batches cap at 500 writes; a friend deck is far below that.
   for (let i = 0; i < ops.length; i += 450) await db.batch(ops.slice(i, i + 450));
   await db.batch([{ op: 'delete', path: D(id) }]);
@@ -197,6 +229,34 @@ export function undo(view, h, me) {
   return setStat(view.deck.id, p, h.key, h.from, me, 'undo', `Undid ${h.byName}'s change`);
 }
 
+// ---------------------------------------------------------------- lives
+
+// A vote is cast as `who` ({uid, name}). In demo mode `who` is whichever
+// demo friend the presenter picked; otherwise it's the signed-in user.
+export async function startVote(deckId, p, reason, who, eligible) {
+  await db.batch([{ op: 'set', path: `${D(deckId)}/votes/${db.newId()}`, data: {
+    pid: p.id, pname: p.name, reason: String(reason || '').slice(0, 140), byUid: who.uid, byName: who.name,
+    yes: { [who.uid]: true }, no: {}, status: statusFor(1, 0, eligible), at: db.now(),
+  } }]);
+}
+
+// Only the voter's own key in each map changes, so two people voting at
+// once don't overwrite each other.
+export async function castVote(deckId, v, who, take, eligible) {
+  const yes = { ...v.yes }, no = { ...v.no };
+  delete yes[who.uid]; delete no[who.uid];
+  (take ? yes : no)[who.uid] = true;
+  const status = statusFor(Object.keys(yes).length, Object.keys(no).length, eligible);
+  await db.batch([{ op: 'update', path: `${D(deckId)}/votes/${v.id}`, data: {
+    [`yes.${who.uid}`]: take ? true : db.del(), [`no.${who.uid}`]: take ? db.del() : true,
+    status, ...(status === 'open' ? {} : { closedAt: db.now() }),
+  } }]);
+}
+
+// Commissioner only: call off an open vote, or hand a taken life back.
+export const closeVote = (deckId, v, status) =>
+  db.batch([{ op: 'update', path: `${D(deckId)}/votes/${v.id}`, data: { status, closedAt: db.now() } }]);
+
 export const setMemberRole = (deckId, uid, role) =>
   db.batch([{ op: 'update', path: `${D(deckId)}/members/${uid}`, data: { role } }]);
 
@@ -205,14 +265,15 @@ export const setMemberRole = (deckId, uid, role) =>
 export async function newEdition(view, me) {
   const old = view.deck, year = (old.year || new Date().getFullYear()) + 1;
   const id = db.newId();
-  const { id: _, createdAt, revealed, ...cfg } = old;
+  const { id: _, createdAt, revealed, revealAt, ...cfg } = old;
   // The deck must exist before its players: the rules check ownership with
   // get(), which sees the database as it was before the batch.
   await db.batch([{ op: 'set', path: D(id), data: {
     ...cfg, name: old.name.replace(String(old.year), String(year)), year, crest: String(year).slice(-2),
     revealed: false, prevDeckId: old.id, ownerUid: me.uid, ownerName: me.name, createdAt: db.now(),
   } }]);
-  const ops = [];
+  // Friends keep the roles they had; lives start fresh (votes aren't copied).
+  const ops = view.members.map(({ id: uid, ...m }) => ({ op: 'set', path: `${D(id)}/members/${uid}`, data: m }));
   for (const p of view.players) {
     const { id: pid, createdAt: c, updatedAt: u, ...rest } = p;
     ops.push({ op: 'set', path: `${D(id)}/players/${pid}`, data: { ...rest, prevOvr: overall(p, old), createdAt: db.now() } });

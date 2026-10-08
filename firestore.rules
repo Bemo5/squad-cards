@@ -2,61 +2,116 @@ rules_version = '2';
 // Squad Cards. Paste into Firebase console > Firestore > Rules > Publish.
 //
 // Who can do what, per deck:
-//   anyone with the link  read the deck config; read cards once revealed
-//   viewer                (signed in) same as above, and shows up in People
+//   anyone with the link  open the deck config; read cards once revealed
+//   viewer                (signed in) same as above, shows up in People, votes on lives
 //   suggester             also sees hidden cards, sends suggestions to the inbox
 //   editor                also changes stat values directly (nothing else)
 //   the friend on a card  changes that card's name, photo and photo position
 //   commissioner (owner)  everything
+//
+// Tested against the emulator by tools/rules-test.cjs.
 service cloud.firestore {
   match /databases/{database}/documents {
     function signedIn() { return request.auth != null; }
+    function me() { return request.auth.uid; }
     function deckDoc(d) { return get(/databases/$(database)/documents/decks/$(d)).data; }
-    function isOwner(d) { return signedIn() && deckDoc(d).ownerUid == request.auth.uid; }
-    function memberPath(d) { return /databases/$(database)/documents/decks/$(d)/members/$(request.auth.uid); }
+    function playerDoc(d, p) { return get(/databases/$(database)/documents/decks/$(d)/players/$(p)).data; }
+    function isOwner(d) { return signedIn() && deckDoc(d).ownerUid == me(); }
+    function memberPath(d) { return /databases/$(database)/documents/decks/$(d)/members/$(me()); }
     function hasRole(d, roles) { return signedIn() && exists(memberPath(d)) && get(memberPath(d)).data.role in roles; }
     function canEdit(d) { return isOwner(d) || hasRole(d, ['editor']); }
     function canSuggest(d) { return isOwner(d) || hasRole(d, ['editor', 'suggester']); }
     function canSee(d) { return deckDoc(d).revealed == true || canSuggest(d); }
     function onlyChanges(keys) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys); }
+    function isStat(v) { return v is int && v >= 1 && v <= 99; }
 
-    match /decks/{d} {
-      allow read: if true;
-      allow create: if signedIn() && request.resource.data.ownerUid == request.auth.uid;
-      allow update: if isOwner(d) && request.resource.data.ownerUid == resource.data.ownerUid;
-      allow delete: if isOwner(d);
+    // Lives. deck.voters is the commissioner plus every member; the owner's
+    // browser keeps it in sync. The friend on a card never votes on it.
+    // statusFor() must match statusFor() in js/overall.js.
+    function eligible(d, p) {
+      let v = deckDoc(d).get('voters', []);
+      let l = playerDoc(d, p).get('linkedUid', '');
+      return v.size() - (l != '' && l in v ? 1 : 0);
+    }
+    function isVoter(d, p) {
+      return signedIn() && me() in deckDoc(d).get('voters', []) && playerDoc(d, p).get('linkedUid', '') != me();
+    }
+    function statusFor(y, n, e) { return y * 2 > e ? 'passed' : (n * 2 >= e ? 'failed' : 'open'); }
+    function statusOk(d, v, p) { return v.status == statusFor(v.yes.size(), v.no.size(), eligible(d, p)); }
+
+    match /decks/{deck} {
+      // Opening a deck by its link works for anyone; listing decks only
+      // ever returns your own.
+      allow get: if true;
+      allow list: if signedIn() && resource.data.ownerUid == me();
+      allow create: if signedIn() && request.resource.data.ownerUid == me();
+      allow update: if isOwner(deck) && request.resource.data.ownerUid == resource.data.ownerUid;
+      allow delete: if isOwner(deck);
 
       match /players/{p} {
-        allow read: if canSee(d);
-        allow create, delete: if isOwner(d);
-        allow update: if isOwner(d)
-          || (hasRole(d, ['editor']) && onlyChanges(['stats', 'updatedAt']))
-          || (signedIn() && resource.data.linkedUid == request.auth.uid && onlyChanges(['name', 'photoPos', 'updatedAt']));
+        allow read: if canSee(deck);
+        allow create, delete: if isOwner(deck);
+        allow update: if isOwner(deck)
+          || (hasRole(deck, ['editor']) && onlyChanges(['stats', 'updatedAt']) && request.resource.data.stats is map)
+          || (signedIn() && resource.data.linkedUid == me() && onlyChanges(['name', 'photoPos', 'updatedAt'])
+              && request.resource.data.name is string && request.resource.data.name.size() <= 18);
       }
 
       match /photos/{p} {
-        allow read: if canSee(d);
-        allow write: if isOwner(d)
-          || (signedIn() && get(/databases/$(database)/documents/decks/$(d)/players/$(p)).data.linkedUid == request.auth.uid);
+        allow read: if canSee(deck);
+        allow delete: if isOwner(deck) || (signedIn() && playerDoc(deck, p).get('linkedUid', '') == me());
+        allow create, update: if (isOwner(deck) || (signedIn() && playerDoc(deck, p).get('linkedUid', '') == me()))
+          && request.resource.data.keys().hasOnly(['data'])
+          && request.resource.data.data is string
+          && request.resource.data.data.size() < 1000000
+          && request.resource.data.data.matches('data:image/(webp|png|jpeg);base64,[A-Za-z0-9+/=]+');
       }
 
       match /members/{uid} {
-        allow read: if isOwner(d) || (signedIn() && request.auth.uid == uid);
-        allow create: if signedIn() && request.auth.uid == uid && request.resource.data.role == 'viewer';
-        allow update, delete: if isOwner(d);
+        allow read: if isOwner(deck) || (signedIn() && me() == uid);
+        // Friends add themselves as viewers; the owner can add anyone (used
+        // when a new edition carries the friends over).
+        allow create: if (signedIn() && me() == uid && request.resource.data.role == 'viewer')
+          || (isOwner(deck) && request.resource.data.role in ['viewer', 'suggester', 'editor']);
+        allow update, delete: if isOwner(deck);
       }
 
       match /suggestions/{s} {
-        allow read: if isOwner(d) || (signedIn() && resource.data.byUid == request.auth.uid);
-        allow create: if canSuggest(d) && request.resource.data.byUid == request.auth.uid
-          && request.resource.data.status == 'pending';
-        allow update, delete: if isOwner(d);
+        allow read: if isOwner(deck) || (signedIn() && resource.data.byUid == me());
+        allow create: if canSuggest(deck) && request.resource.data.byUid == me()
+          && request.resource.data.status == 'pending' && isStat(request.resource.data.to);
+        allow update, delete: if isOwner(deck);
       }
 
       match /history/{h} {
-        allow read: if canSee(d);
-        allow create: if canEdit(d) && request.resource.data.byUid == request.auth.uid;
-        allow update, delete: if isOwner(d);
+        allow read: if canSee(deck);
+        allow create: if canEdit(deck) && request.resource.data.byUid == me() && isStat(request.resource.data.to);
+        allow update, delete: if isOwner(deck);
+      }
+
+      match /votes/{v} {
+        allow read: if canSee(deck);
+        // Start a vote: you're its first "yes".
+        allow create: if canSee(deck) && deckDoc(deck).get('lives', 5) > 0
+          && isVoter(deck, request.resource.data.pid)
+          && request.resource.data.byUid == me()
+          && request.resource.data.yes.keys().hasOnly([me()]) && request.resource.data.yes.size() == 1
+          && request.resource.data.no.size() == 0
+          && request.resource.data.reason is string && request.resource.data.reason.size() <= 140
+          && statusOk(deck, request.resource.data, request.resource.data.pid);
+        // Cast or change your own ballot on an open vote. The status must be
+        // what the ballots say, so nobody can close a vote early.
+        allow update: if (resource.data.status == 'open' && isVoter(deck, resource.data.pid)
+            && onlyChanges(['yes', 'no', 'status', 'closedAt'])
+            && request.resource.data.yes.diff(resource.data.yes).affectedKeys().hasOnly([me()])
+            && request.resource.data.no.diff(resource.data.no).affectedKeys().hasOnly([me()])
+            && !(me() in request.resource.data.yes && me() in request.resource.data.no)
+            && statusOk(deck, request.resource.data, resource.data.pid))
+          // The commissioner can call off an open vote or give a life back.
+          || (isOwner(deck) && onlyChanges(['status', 'closedAt'])
+            && ((resource.data.status == 'open' && request.resource.data.status == 'cancelled')
+             || (resource.data.status == 'passed' && request.resource.data.status == 'overturned')));
+        allow delete: if isOwner(deck);
       }
     }
   }

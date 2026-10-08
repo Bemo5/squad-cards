@@ -58,5 +58,30 @@ export function deckTemplate(year) {
       { name: 'Silver', min: 65, skin: 'silver' },
       { name: 'Bronze', min: 0, skin: 'bronze' },
     ],
+    lives: 5,
   };
 }
+
+// Lives. Each card starts with deck.lives (0 turns the feature off). A life
+// goes when a vote passes: more than half of the eligible voters say "take
+// it". The card's own friend never votes on their card. firestore.rules
+// repeats statusFor() exactly, so a client can't close a vote early.
+export const MAX_LIVES = 9;
+export const livesTotal = deck => {
+  const n = Number(deck?.lives ?? 5);
+  return Number.isFinite(n) ? Math.max(0, Math.min(MAX_LIVES, Math.round(n))) : 5;
+};
+
+export function livesLeft(deck, p, votes) {
+  const lost = votes.filter(v => v.pid === p.id && v.status === 'passed').length;
+  return Math.max(0, livesTotal(deck) - lost);
+}
+
+export function statusFor(yes, no, eligible) {
+  if (yes * 2 > eligible) return 'passed';
+  if (no * 2 >= eligible) return 'failed';
+  return 'open';
+}
+
+// Votes needed to take a life, for display.
+export const votesNeeded = eligible => Math.floor(eligible / 2) + 1;
